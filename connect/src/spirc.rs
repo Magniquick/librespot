@@ -706,6 +706,10 @@ impl SpircTask {
                 self.context_resolver.mark_next_unavailable();
                 self.context_resolver.remove_used_and_invalid();
                 error!("{why}");
+                if !self.context_resolver.has_next() {
+                    // The transfer's context can't be resolved: it will not finish.
+                    self.transfer_state = None;
+                }
                 return false;
             }
             Ok(ctx) => ctx,
@@ -1228,9 +1232,16 @@ impl SpircTask {
     }
 
     fn handle_transfer(&mut self, mut transfer: TransferState) -> Result<(), Error> {
+        // A transfer replaces one still being set up; finishing that one later,
+        // or its resolve replacing the context, would undo this one.
+        if self.transfer_state.take().is_some() {
+            self.context_resolver.clear();
+        }
         let mut ctx_uri = match transfer.current_session.context.uri {
-            None => Err(SpircError::NoUri("transfer context"))?,
-            // can apparently happen when a state is transferred and was started with "uris" via the api
+            // can apparently happen when a state is transferred and was started with "uris" via
+            // the api, or when the source device has no session left (an idle phone): fall back
+            // to the transferred track
+            None => None,
             Some(ref uri) if uri == "-" || uri.is_empty() => None,
             Some(ref uri) => Some(uri.clone()),
         };
@@ -1256,7 +1267,7 @@ impl SpircTask {
         }
 
         let fallback = self.connect_state.current_track(|t| &t.uri).clone();
-        let load_from_context_uri = ctx_uri.is_some();
+        let mut load_from_context_uri = ctx_uri.is_some();
 
         match ctx_uri {
             Some(ref uri) => {
@@ -1279,11 +1290,22 @@ impl SpircTask {
 
                 if !all_tracks.is_empty() {
                     self.load_context_from_tracks(all_tracks)?;
-                } else {
+                } else if !fallback.is_empty() {
+                    // No context and no tracks, but a track: resolve the track as
+                    // its own context, so the transfer finishes and autoplay follows.
                     warn!(
                         "tried to transfer with an invalid state, using fallback as ctx_uri ({fallback})"
                     );
-                    ctx_uri = Some(fallback.clone())
+                    self.context_resolver.add(ResolveContext::from_uri(
+                        fallback.clone(),
+                        &fallback,
+                        ContextType::Default,
+                        ContextAction::Replace,
+                    ));
+                    ctx_uri = Some(fallback.clone());
+                    load_from_context_uri = true;
+                } else {
+                    warn!("the transfer carried no context and no track, nothing to continue");
                 }
             }
         };
@@ -1320,13 +1342,21 @@ impl SpircTask {
             }
         }
 
+        // The transfer finishes when its context resolves; a resolve the resolver
+        // declined (a context it marked unavailable) will never finish it.
         if load_from_context_uri {
-            self.transfer_state = Some(transfer);
+            if self.context_resolver.has_next() {
+                self.transfer_state = Some(transfer);
+            }
         } else {
             match self.connect_state.get_context(ContextType::Default) {
                 Err(why) => {
                     warn!("continuing transfer in an unknown state. {why}");
-                    self.transfer_state = Some(transfer);
+                    // Only a resolve still to come can finish the transfer; without
+                    // one the state would linger and be applied over later playback.
+                    if self.context_resolver.has_next() {
+                        self.transfer_state = Some(transfer);
+                    }
                 }
                 Ok(ctx) => {
                     let idx = ConnectState::find_index_in_context(ctx, |pt| {
@@ -1342,6 +1372,8 @@ impl SpircTask {
 
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
         self.context_resolver.clear();
+        // Nothing will finish setting up a transfer.
+        self.transfer_state = None;
 
         self.play_status = SpircPlayStatus::Stopped {};
         self.connect_state
@@ -1401,6 +1433,11 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
+        // A load replaces a transfer still being set up; finishing that transfer,
+        // or its resolve replacing the context, would undo the load.
+        if self.transfer_state.take().is_some() {
+            self.context_resolver.clear();
+        }
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
                 ResetContext::WhenDifferent(uri)
