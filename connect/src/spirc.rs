@@ -1013,7 +1013,6 @@ impl SpircTask {
             }
             PlayerEvent::ShuffleChanged { .. } => Some(PlayerUpdateReason::ShuffleChanged),
             PlayerEvent::RepeatChanged { .. } => Some(PlayerUpdateReason::RepeatChanged),
-            PlayerEvent::SetQueue { .. } => Some(PlayerUpdateReason::QueueChanged),
             _ => None,
         };
 
@@ -1150,8 +1149,7 @@ impl SpircTask {
             }
             PlayerEvent::TrackChanged { .. }
             | PlayerEvent::ShuffleChanged { .. }
-            | PlayerEvent::RepeatChanged { .. }
-            | PlayerEvent::SetQueue { .. } => {}
+            | PlayerEvent::RepeatChanged { .. } => {}
             PlayerEvent::VolumeChanged { .. }
             | PlayerEvent::SessionConnected { .. }
             | PlayerEvent::SessionDisconnected { .. }
@@ -2596,6 +2594,7 @@ fn classify_player_update_reasons(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use librespot_protocol::player::ProvidedTrack;
 
     fn state_with(f: impl FnOnce(&mut PlayerState)) -> PlayerState {
         let mut state = PlayerState::default();
