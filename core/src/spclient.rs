@@ -21,6 +21,8 @@ use crate::{
         extended_metadata::BatchedEntityRequest,
         extended_metadata::{BatchedExtensionResponse, EntityRequest, ExtensionQuery},
         extension_kind::ExtensionKind,
+        ucs::{UcsRequest, UcsResponseWrapper, ucs_response_wrapper},
+        useraccount::AccountAttribute,
     },
     token::Token,
     util,
@@ -642,6 +644,52 @@ impl SpClient {
 
     pub async fn get_show_metadata(&self, show_uri: &SpotifyUri) -> SpClientResult {
         self.get_metadata(ExtensionKind::SHOW_V4, show_uri).await
+    }
+
+    /// The account attributes (autoplay, explicit filter, ...) as the user
+    /// customization service reports them. The AP's product info omits some of
+    /// them on some platforms (autoplay on Windows), and attribute mutations only
+    /// name the changed field, so this is the authoritative source.
+    pub async fn get_account_attributes(
+        &self,
+    ) -> Result<std::collections::HashMap<String, AccountAttribute>, Error> {
+        let mut request = UcsRequest::new();
+        // The service rejects a request without an origin (400).
+        let caller = request.caller_info.mut_or_insert_default();
+        caller.request_origin_id = "librespot".into();
+        caller.request_orgin_version = crate::version::SEMVER.into();
+        caller.reason = "attribute-refresh".into();
+        request.account_attributes_request = protobuf::MessageField::some(Default::default());
+
+        // Without this the answer is JSON, twice the size.
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/x-protobuf"));
+
+        let response = self
+            .request_with_protobuf(
+                &Method::POST,
+                "/user-customization-service/v1/customize",
+                Some(headers),
+                &request,
+            )
+            .await?;
+        let wrapper = UcsResponseWrapper::parse_from_bytes(&response)?;
+        match wrapper.result {
+            Some(ucs_response_wrapper::Result::Success(success)) => match success.account_attributes_result {
+                Some(ucs_response_wrapper::ucs_response::Account_attributes_result::AccountAttributesSuccess(attributes)) => {
+                    Ok(attributes.account_attributes)
+                }
+                Some(ucs_response_wrapper::ucs_response::Account_attributes_result::AccountAttributesError(error)) => {
+                    Err(Error::failed_precondition(format!("account attributes: {} {}", error.error_code, error.error_message)))
+                }
+                _ => Err(Error::failed_precondition("account attributes missing from the response")),
+            },
+            Some(ucs_response_wrapper::Result::Error(error)) => Err(Error::failed_precondition(format!(
+                "user customization service: {} {}",
+                error.error_code, error.error_message
+            ))),
+            _ => Err(Error::failed_precondition("empty user customization response")),
+        }
     }
 
     pub async fn get_lyrics(&self, track_id: &SpotifyId) -> SpClientResult {

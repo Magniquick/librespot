@@ -24,6 +24,7 @@ use crate::{
         social_connect_v2::SessionUpdate,
         transfer_state::TransferState,
         user_attributes::UserAttributesMutation,
+        useraccount::{AccountAttribute, account_attribute::Value},
     },
     state::{
         context::{ContextType, ResetContext},
@@ -35,6 +36,7 @@ use futures_util::StreamExt;
 use librespot_protocol::context_page::ContextPage;
 use protobuf::MessageField;
 use std::{
+    collections::HashMap,
     future::Future,
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
@@ -100,6 +102,15 @@ struct SpircTask {
 
     /// is set when transferring, and used after resolving the contexts to finish the transfer
     pub transfer_state: Option<TransferState>,
+    background_tx: mpsc::UnboundedSender<Background>,
+    background_rx: mpsc::UnboundedReceiver<Background>,
+    /// The user customization service answered for autoplay this connection;
+    /// don't ask again on every dealer reconnect.
+    autoplay_fetched: bool,
+    attribute_requests: u64,
+    /// Keys asked for but not yet applied, with how many change notices named
+    /// each (for the flip fallback); a newer fetch covers them too.
+    pending_attribute_keys: Vec<(String, u32)>,
 
     /// when set to true, it will update the volume after [VOLUME_UPDATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
@@ -144,6 +155,25 @@ const CONTEXT_FETCH_THRESHOLD: usize = 2;
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
 // to reduce updates to remote, we group some request by waiting for a set amount of time
 const UPDATE_STATE_DELAY: Duration = Duration::from_millis(200);
+
+/// Results of requests the task runs off its loop, so HTTP never stalls it.
+enum Background {
+    Attributes {
+        /// Only the newest fetch is applied: an older one may answer last.
+        request: u64,
+        result: Result<HashMap<String, AccountAttribute>, Error>,
+    },
+}
+
+/// An account attribute in the form the session caches it ("1"/"0" for booleans).
+fn attribute_value(attribute: Option<&AccountAttribute>) -> Option<String> {
+    match attribute.and_then(|attribute| attribute.value.as_ref())? {
+        Value::BoolValue(value) => Some(if *value { "1" } else { "0" }.to_string()),
+        Value::LongValue(value) => Some(value.to_string()),
+        Value::StringValue(value) => Some(value.clone()),
+        _ => None,
+    }
+}
 
 /// The spotify connect handle
 pub struct Spirc {
@@ -286,6 +316,7 @@ impl Spirc {
         let player_events = player.get_player_event_channel();
 
         let disconnected_playback = Arc::new(Mutex::new(None));
+        let (background_tx, background_rx) = mpsc::unbounded_channel();
         let mut task = SpircTask {
             disconnected_playback: Arc::clone(&disconnected_playback),
             player,
@@ -315,6 +346,11 @@ impl Spirc {
             session,
 
             transfer_state: None,
+            background_tx,
+            background_rx,
+            autoplay_fetched: false,
+            attribute_requests: 0,
+            pending_attribute_keys: Vec::new(),
             update_volume: false,
             update_state: false,
 
@@ -596,6 +632,9 @@ impl SpircTask {
                     if let Err(e) = self.handle_player_event(event) {
                         error!("could not dispatch player event: {e}");
                     }
+                },
+                background = self.background_rx.recv() => if let Some(background) = background {
+                    self.handle_background(background);
                 },
                 _ = async { sleep(UPDATE_STATE_DELAY).await }, if self.update_state => {
                     self.update_state = false;
@@ -958,6 +997,14 @@ impl SpircTask {
 
         self.connect_established = true;
 
+        if self.session.config().autoplay.is_none()
+            && self.session.get_user_attribute("autoplay").is_none()
+            && !self.autoplay_fetched
+        {
+            debug!("autoplay missing from the product info, asking the user customization service");
+            self.request_account_attributes(vec!["autoplay".to_string()], false);
+        }
+
         let same_session = cluster.player_state.session_id == self.session.session_id()
             || cluster.player_state.session_id.is_empty();
         if !cluster.active_device_id.is_empty() || !same_session {
@@ -997,37 +1044,142 @@ impl SpircTask {
     }
 
     fn handle_user_attributes_mutation(&mut self, mutation: UserAttributesMutation) {
-        for attribute in mutation.fields.iter() {
-            let key = &attribute.name;
+        let keys = mutation
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
+        self.request_account_attributes(keys, true);
+    }
 
-            if key == "autoplay" && self.session.config().autoplay.is_some() {
-                trace!("Autoplay override active. Ignoring mutation.");
+    /// Asks the user customization service for the named account attributes.
+    /// A mutation only names the changed field, and the AP's product info omits
+    /// some attributes on some platforms (autoplay on Windows), so flipping a
+    /// cached value either had nothing to flip or could invert the state after a
+    /// duplicated or missed mutation. The request runs off the loop.
+    fn request_account_attributes(&mut self, keys: Vec<String>, notices: bool) {
+        let override_autoplay = self.session.config().autoplay.is_some();
+        let keys: Vec<String> = keys
+            .into_iter()
+            .filter(|key| !(override_autoplay && key == "autoplay"))
+            .collect();
+        if keys.is_empty() {
+            trace!("no account attribute to refresh (empty notice, or autoplay overridden)");
+            return;
+        }
+        for key in keys {
+            let notice = u32::from(notices);
+            match self
+                .pending_attribute_keys
+                .iter_mut()
+                .find(|(pending, _)| *pending == key)
+            {
+                Some((_, count)) => *count += notice,
+                None => self.pending_attribute_keys.push((key, notice)),
+            }
+        }
+        let keys: Vec<String> = self
+            .pending_attribute_keys
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
+        // Keys named by an odd number of notices are expected to have changed.
+        let old: Vec<Option<String>> = self
+            .pending_attribute_keys
+            .iter()
+            .map(|(key, notices)| {
+                if notices % 2 == 1 {
+                    self.session.get_user_attribute(key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.attribute_requests += 1;
+        let request = self.attribute_requests;
+        let session = self.session.clone();
+        let background = self.background_tx.clone();
+        self.session.spawn(async move {
+            let mut result = session.spclient().get_account_attributes().await;
+            // The notice can arrive before the service reflects the change:
+            // a value still equal to the old one earns one more look.
+            let unchanged = match &result {
+                Ok(attributes) => keys.iter().zip(&old).any(|(key, old)| {
+                    old.is_some() && attribute_value(attributes.get(key)) == *old
+                }),
+                Err(_) => false,
+            };
+            if unchanged {
+                sleep(Duration::from_secs(1)).await;
+                result = session.spclient().get_account_attributes().await;
+            }
+            let _ = background.send(Background::Attributes { request, result });
+        });
+    }
+
+    fn handle_background(&mut self, background: Background) {
+        match background {
+            Background::Attributes { request, result } => {
+                if request == self.attribute_requests {
+                    let keys = std::mem::take(&mut self.pending_attribute_keys);
+                    self.apply_account_attributes(keys, result);
+                } else {
+                    trace!("dropping a superseded account attribute fetch");
+                }
+            }
+        }
+    }
+
+    fn apply_account_attributes(
+        &mut self,
+        keys: Vec<(String, u32)>,
+        result: Result<HashMap<String, AccountAttribute>, Error>,
+    ) {
+        let fetched = match result {
+            Ok(attributes) => {
+                self.autoplay_fetched |= keys.iter().any(|(key, _)| key == "autoplay");
+                Some(attributes)
+            }
+            Err(why) => {
+                warn!("couldn't fetch account attributes, toggling the cached values: {why}");
+                None
+            }
+        };
+
+        for (key, notices) in &keys {
+            let old_value = self.session.get_user_attribute(key);
+            // Each notice flipped the value once: an even number leaves it.
+            let flipped = || {
+                old_value.as_deref().map(|old| match (old, notices % 2) {
+                    ("0", 1) => "1".to_string(),
+                    ("1", 1) => "0".to_string(),
+                    (other, _) => other.to_string(),
+                })
+            };
+            // A key the service doesn't report falls back to flipping, as before.
+            let new_value = match &fetched {
+                Some(attributes) => attribute_value(attributes.get(key)).or_else(flipped),
+                None => flipped(),
+            };
+            let Some(new_value) = new_value else {
+                trace!("no value is known for attribute {key}");
+                continue;
+            };
+            if old_value.as_deref() == Some(new_value.as_str()) {
                 continue;
             }
+            self.session.set_user_attribute(key, &new_value);
+            trace!("attribute {key} was {old_value:?} is now {new_value}");
 
-            if let Some(old_value) = self.session.user_data().attributes.get(key) {
-                let new_value = match old_value.as_ref() {
-                    "0" => "1",
-                    "1" => "0",
-                    _ => old_value,
-                };
-                self.session.set_user_attribute(key, new_value);
-
-                trace!("Received attribute mutation, {key} was {old_value} is now {new_value}");
-
-                if key == "filter-explicit-content" && new_value == "1" {
-                    self.player
-                        .emit_filter_explicit_content_changed_event(matches!(new_value, "1"));
-                }
-
-                if key == "autoplay" && old_value != new_value {
-                    self.player
-                        .emit_auto_play_changed_event(matches!(new_value, "1"));
-
+            match key.as_str() {
+                "filter-explicit-content" => self
+                    .player
+                    .emit_filter_explicit_content_changed_event(new_value == "1"),
+                "autoplay" => {
+                    self.player.emit_auto_play_changed_event(new_value == "1");
                     self.add_autoplay_resolving_when_required()
                 }
-            } else {
-                trace!("Received attribute mutation for {key} but key was not found!");
+                _ => {}
             }
         }
     }
