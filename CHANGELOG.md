@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [core] Add an in-memory credential cache for clients that persist grants in a protected store
 - [core] Add method `get_playlist_range` to `SpClient` for a window of a playlist's items with its header decorated on
 - [metadata] Add `Playlist::get_range` to fetch a window of a playlist's items without downloading the whole list
+- [connect] Add broadcast/watch channels to `Spirc` for observing remote player, cluster, and queue state independent of whether this device is active
 
 ### Fixed
 
