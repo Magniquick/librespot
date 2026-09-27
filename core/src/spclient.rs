@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::Write,
     time::{Duration, SystemTime},
 };
@@ -21,7 +22,10 @@ use crate::{
         extended_metadata::BatchedEntityRequest,
         extended_metadata::{BatchedExtensionResponse, EntityRequest, ExtensionQuery},
         extension_kind::ExtensionKind,
-        ucs::{UcsRequest, UcsResponseWrapper, ucs_response_wrapper},
+        ucs::{
+            UcsRequest, UcsResponseWrapper, ucs_response_wrapper,
+            ucs_response_wrapper::ucs_response::Account_attributes_result,
+        },
         useraccount::AccountAttribute,
     },
     token::Token,
@@ -650,9 +654,7 @@ impl SpClient {
     /// customization service reports them. The AP's product info omits some of
     /// them on some platforms (autoplay on Windows), and attribute mutations only
     /// name the changed field, so this is the authoritative source.
-    pub async fn get_account_attributes(
-        &self,
-    ) -> Result<std::collections::HashMap<String, AccountAttribute>, Error> {
+    pub async fn get_account_attributes(&self) -> Result<HashMap<String, AccountAttribute>, Error> {
         let mut request = UcsRequest::new();
         // The service rejects a request without an origin (400).
         let caller = request.caller_info.mut_or_insert_default();
@@ -675,20 +677,31 @@ impl SpClient {
             .await?;
         let wrapper = UcsResponseWrapper::parse_from_bytes(&response)?;
         match wrapper.result {
-            Some(ucs_response_wrapper::Result::Success(success)) => match success.account_attributes_result {
-                Some(ucs_response_wrapper::ucs_response::Account_attributes_result::AccountAttributesSuccess(attributes)) => {
-                    Ok(attributes.account_attributes)
+            Some(ucs_response_wrapper::Result::Success(success)) => {
+                match success.account_attributes_result {
+                    Some(Account_attributes_result::AccountAttributesSuccess(attributes)) => {
+                        Ok(attributes.account_attributes)
+                    }
+                    Some(Account_attributes_result::AccountAttributesError(error)) => {
+                        Err(Error::failed_precondition(format!(
+                            "account attributes: {} {}",
+                            error.error_code, error.error_message
+                        )))
+                    }
+                    _ => Err(Error::failed_precondition(
+                        "account attributes missing from the response",
+                    )),
                 }
-                Some(ucs_response_wrapper::ucs_response::Account_attributes_result::AccountAttributesError(error)) => {
-                    Err(Error::failed_precondition(format!("account attributes: {} {}", error.error_code, error.error_message)))
-                }
-                _ => Err(Error::failed_precondition("account attributes missing from the response")),
-            },
-            Some(ucs_response_wrapper::Result::Error(error)) => Err(Error::failed_precondition(format!(
-                "user customization service: {} {}",
-                error.error_code, error.error_message
-            ))),
-            _ => Err(Error::failed_precondition("empty user customization response")),
+            }
+            Some(ucs_response_wrapper::Result::Error(error)) => {
+                Err(Error::failed_precondition(format!(
+                    "user customization service: {} {}",
+                    error.error_code, error.error_message
+                )))
+            }
+            _ => Err(Error::failed_precondition(
+                "empty user customization response",
+            )),
         }
     }
 
