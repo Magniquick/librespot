@@ -908,11 +908,26 @@ impl SpircTask {
                 return Ok(());
             }
             SpircCommand::Transfer(request) if !self.connect_state.is_active() => {
-                let device_id = self.session.device_id();
-                self.session
-                    .spclient()
-                    .transfer(device_id, device_id, request.as_ref())
-                    .await?;
+                // Spotify answers the request only after this task has handled the
+                // transfer it sends back over the dealer, so the request can't be
+                // awaited here. Pull from the active device, as the official
+                // clients do.
+                let to = self.session.device_id().to_string();
+                let from = if self.active_device_id.is_empty() {
+                    to.clone()
+                } else {
+                    self.active_device_id.clone()
+                };
+                let session = self.session.clone();
+                self.session.spawn(async move {
+                    if let Err(why) = session
+                        .spclient()
+                        .transfer(&from, &to, request.as_ref())
+                        .await
+                    {
+                        warn!("transfer to this device failed: {why}");
+                    }
+                });
                 return Ok(());
             }
             SpircCommand::Activate if !self.connect_state.is_active() => {
