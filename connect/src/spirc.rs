@@ -4,10 +4,9 @@ use crate::{
     core::{
         Error, Session, SpotifyUri,
         authentication::Credentials,
-        dealer::protocol::TransferOptions,
         dealer::{
             manager::{BoxedStream, BoxedStreamResult, Reply, RequestReply},
-            protocol::{Command, FallbackWrapper, Message, Request},
+            protocol::{Command, FallbackWrapper, Message, Request, TransferOptions},
         },
         session::UserAttributes,
         spclient::TransferRequest,
@@ -788,9 +787,9 @@ impl Spirc {
     }
 
     /// Hands playback to another device through the Connect transfer flow, the
-    /// way the official clients do: the current state is published first, so the
-    /// target resumes exactly where playback is, then the transfer is requested.
-    /// Works from this device, or between two other devices.
+    /// way the official clients do: a state change not yet published is sent
+    /// first, so the target resumes exactly where playback is, then the transfer
+    /// is requested. Works from this device, or between two other devices.
     ///
     /// The receiver resolves when the target is the active device, or with an
     /// error when the request fails, a newer transfer replaces it, or the target
@@ -1163,6 +1162,13 @@ impl SpircTask {
     /// Resolves the next context off the loop, once: work on the loop would
     /// cancel an in-flight request and send it again.
     fn start_resolving(&mut self) {
+        if self
+            .resolving
+            .as_ref()
+            .is_some_and(|item| self.context_resolver.is_next(item))
+        {
+            return;
+        }
         let recent_track_uris = || {
             // Sending local file URIs to this endpoint results in a Bad Request status.
             // It's likely appropriate to filter them out anyway; Spotify's backend
@@ -1176,9 +1182,6 @@ impl SpircTask {
         let Some((item, request)) = self.context_resolver.next_request(recent_track_uris) else {
             return;
         };
-        if self.resolving.as_ref() == Some(&item) {
-            return;
-        }
         self.resolving = Some(item.clone());
         let resolved = self.resolved_tx.clone();
         self.session.spawn(async move {
@@ -1192,10 +1195,7 @@ impl SpircTask {
                 self.context_resolver.mark_next_unavailable();
                 self.context_resolver.remove_used_and_invalid();
                 error!("{why}");
-                if !self.context_resolver.has_next() {
-                    // The transfer's context can't be resolved: it will not finish.
-                    self.transfer_state = None;
-                }
+                self.drop_unfinishable_transfer();
                 self.resume_pending_end_of_track();
                 return false;
             }
@@ -1229,8 +1229,17 @@ impl SpircTask {
         };
 
         self.context_resolver.remove_used_and_invalid();
+        self.drop_unfinishable_transfer();
         self.resume_pending_end_of_track();
         update_state
+    }
+
+    /// A transfer finishes when its context resolves; with nothing left to
+    /// resolve it never will, and applied later it would undo newer playback.
+    fn drop_unfinishable_transfer(&mut self) {
+        if !self.context_resolver.has_next() {
+            self.transfer_state = None;
+        }
     }
 
     // todo: is the time_delta still necessary?
@@ -1272,11 +1281,18 @@ impl SpircTask {
                 };
                 let session = self.session.clone();
                 self.session.spawn(async move {
-                    if let Err(why) = session
+                    let mut result = session
                         .spclient()
                         .transfer(&from, &to, request.as_ref())
-                        .await
-                    {
+                        .await;
+                    // The cluster's active device may be gone: ask as this device.
+                    if result.is_err() && from != to {
+                        result = session
+                            .spclient()
+                            .transfer(&to, &to, request.as_ref())
+                            .await;
+                    }
+                    if let Err(why) = result {
                         warn!("transfer to this device failed: {why}");
                     }
                 });
@@ -2100,10 +2116,9 @@ impl SpircTask {
             self.context_resolver.clear();
         }
         let mut ctx_uri = match transfer.current_session.context.uri {
-            // can apparently happen when a state is transferred and was started with "uris" via
-            // the api, or when the source device has no session left (an idle phone): fall back
-            // to the transferred track
             None => None,
+            // can apparently happen when a state is transferred and was started with "uris" via the api,
+            // and without any uri from a device with no session left (an idle phone)
             Some(ref uri) if uri == "-" || uri.is_empty() => None,
             Some(ref uri) => Some(uri.clone()),
         };
@@ -2185,7 +2200,6 @@ impl SpircTask {
             ContextType::Default
         };
 
-        // update position if the track continued playing
         let position = transfer_position(&transfer.playback, timestamp);
 
         let is_playing = !transfer.playback.is_paused();
@@ -2262,11 +2276,11 @@ impl SpircTask {
     }
 
     /// Who sent a command: a device from the cluster, a Web API app
-    /// (`webapi-<client id>`), or nobody remote (`local`, a command from here).
+    /// (`webapi-<client id>`), or nobody remote (`local` or this device).
     /// `Some(None)` for a command from here, `Some(Some(_))` for a named remote
     /// controller, `None` for a device the device list doesn't name yet.
     fn controller_for(&self, sender: &str) -> Option<Option<Controller>> {
-        if sender.is_empty() || sender == "local" || sender == self.session.device_id() {
+        if sender == "local" || sender == self.session.device_id() {
             return Some(None);
         }
         if let Some(device) = self.devices.get(sender) {
@@ -2286,6 +2300,10 @@ impl SpircTask {
     }
 
     fn set_controller_from(&mut self, sender: &str) {
+        // A request that names no sender says nothing about who controls.
+        if sender.is_empty() {
+            return;
+        }
         match self.controller_for(sender) {
             Some(controller) => {
                 self.controller = controller;
@@ -2332,7 +2350,10 @@ impl SpircTask {
         self.publish_local_activation(true);
         self.player
             .emit_session_connected_event(self.session.connection_id(), self.session.username());
-        self.report_client(true);
+        // A sender the device list doesn't name yet is reported once it does.
+        if self.unresolved_sender.is_none() {
+            self.report_client(true);
+        }
 
         self.player
             .emit_volume_changed_event(self.connect_state.device_info().volume as u16);
@@ -2545,7 +2566,6 @@ impl SpircTask {
                     nominal_start_time: self.now_ms() - position_ms as i64,
                     preloading_of_next_track_triggered,
                 };
-                self.connect_state.set_status(&self.play_status);
             }
             SpircPlayStatus::LoadingPause { position_ms } => {
                 self.player.play();
@@ -2780,10 +2800,6 @@ impl SpircTask {
                     self.load_track(self.connect_state.is_playing(), 0)?
                 }
             }
-        } else if self.pending_end_of_track.take().is_some() {
-            // The track already ended (past its end on a transfer) and the player
-            // has nothing to seek: restart it by loading it again.
-            self.load_track(self.connect_state.is_playing(), 0)?;
         } else {
             self.handle_seek(0);
         }
@@ -3002,83 +3018,84 @@ impl Drop for SpircTask {
 }
 
 #[cfg(test)]
-mod recovery_tests {
-    mod transfer_position {
-        use super::super::transfer_position;
-        use librespot_protocol::playback::Playback;
+mod transfer_position_tests {
+    use super::transfer_position;
+    use librespot_protocol::playback::Playback;
 
-        fn playback(position: i32, timestamp: i64, speed: Option<f64>, paused: bool) -> Playback {
-            Playback {
-                position_as_of_timestamp: Some(position),
-                timestamp: Some(timestamp),
-                playback_speed: speed,
-                is_paused: Some(paused),
-                ..Default::default()
-            }
-        }
-
-        #[test]
-        fn a_playing_track_moves_on_from_where_it_was_published() {
-            assert_eq!(
-                transfer_position(&playback(60_000, 1_000, Some(1.0), false), 6_000),
-                65_000
-            );
-        }
-
-        #[test]
-        fn a_track_published_at_zero_still_moves_on() {
-            assert_eq!(
-                transfer_position(&playback(0, 1_000, Some(1.0), false), 12_000),
-                11_000
-            );
-        }
-
-        #[test]
-        fn paused_or_speed_zero_or_missing_speed_stays_put() {
-            assert_eq!(
-                transfer_position(&playback(60_000, 1_000, Some(1.0), true), 9_000),
-                60_000
-            );
-            assert_eq!(
-                transfer_position(&playback(60_000, 1_000, Some(0.0), false), 9_000),
-                60_000
-            );
-            assert_eq!(
-                transfer_position(&playback(60_000, 1_000, None, false), 9_000),
-                60_000
-            );
-        }
-
-        #[test]
-        fn a_missing_timestamp_is_not_extrapolated_from_the_epoch() {
-            assert_eq!(
-                transfer_position(&playback(5_000, 0, Some(1.0), false), 1_790_000_000_000),
-                5_000
-            );
-        }
-
-        #[test]
-        fn out_of_range_data_is_clamped_not_failed() {
-            assert_eq!(
-                transfer_position(&playback(-5, 1_000, Some(1.0), true), 2_000),
-                0
-            );
-            assert_eq!(
-                transfer_position(&playback(0, 1_000, Some(-3.0), false), 9_000),
-                0
-            );
-            assert_eq!(
-                transfer_position(&playback(i32::MAX, 1, Some(f64::MAX), false), i64::MAX),
-                u32::MAX
-            );
-            // A clock behind the publisher's doesn't move the position back.
-            assert_eq!(
-                transfer_position(&playback(60_000, 9_000, Some(1.0), false), 1_000),
-                60_000
-            );
+    fn playback(position: i32, timestamp: i64, speed: Option<f64>, paused: bool) -> Playback {
+        Playback {
+            position_as_of_timestamp: Some(position),
+            timestamp: Some(timestamp),
+            playback_speed: speed,
+            is_paused: Some(paused),
+            ..Default::default()
         }
     }
 
+    #[test]
+    fn a_playing_track_moves_on_from_where_it_was_published() {
+        assert_eq!(
+            transfer_position(&playback(60_000, 1_000, Some(1.0), false), 6_000),
+            65_000
+        );
+    }
+
+    #[test]
+    fn a_track_published_at_zero_still_moves_on() {
+        assert_eq!(
+            transfer_position(&playback(0, 1_000, Some(1.0), false), 12_000),
+            11_000
+        );
+    }
+
+    #[test]
+    fn paused_or_speed_zero_or_missing_speed_stays_put() {
+        assert_eq!(
+            transfer_position(&playback(60_000, 1_000, Some(1.0), true), 9_000),
+            60_000
+        );
+        assert_eq!(
+            transfer_position(&playback(60_000, 1_000, Some(0.0), false), 9_000),
+            60_000
+        );
+        assert_eq!(
+            transfer_position(&playback(60_000, 1_000, None, false), 9_000),
+            60_000
+        );
+    }
+
+    #[test]
+    fn a_missing_timestamp_is_not_extrapolated_from_the_epoch() {
+        assert_eq!(
+            transfer_position(&playback(5_000, 0, Some(1.0), false), 1_790_000_000_000),
+            5_000
+        );
+    }
+
+    #[test]
+    fn out_of_range_data_is_clamped_not_failed() {
+        assert_eq!(
+            transfer_position(&playback(-5, 1_000, Some(1.0), true), 2_000),
+            0
+        );
+        assert_eq!(
+            transfer_position(&playback(0, 1_000, Some(-3.0), false), 9_000),
+            0
+        );
+        assert_eq!(
+            transfer_position(&playback(i32::MAX, 1, Some(f64::MAX), false), i64::MAX),
+            u32::MAX
+        );
+        // A clock behind the publisher's doesn't move the position back.
+        assert_eq!(
+            transfer_position(&playback(60_000, 9_000, Some(1.0), false), 1_000),
+            60_000
+        );
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
     use super::*;
 
     #[tokio::test]
