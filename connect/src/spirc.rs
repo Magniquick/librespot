@@ -1550,6 +1550,8 @@ impl SpircTask {
             }
         }
         .ok_or(SpircError::FailedDealerSetup)?;
+        // published before the device list is taken for naming controllers
+        self.sync_cluster_state(&cluster);
         self.devices = std::mem::take(&mut cluster.device);
         self.active_device_id = cluster.active_device_id.clone();
         self.resolve_pending_transfer();
@@ -1560,7 +1562,6 @@ impl SpircTask {
         );
 
         self.connect_established = true;
-        self.sync_cluster_state(&cluster);
 
         if self.session.config().autoplay.is_none()
             && self.session.get_user_attribute("autoplay").is_none()
@@ -2116,9 +2117,9 @@ impl SpircTask {
             self.context_resolver.clear();
         }
         let mut ctx_uri = match transfer.current_session.context.uri {
+            // no uri at all comes from a device with no session left (an idle phone)
             None => None,
-            // can apparently happen when a state is transferred and was started with "uris" via the api,
-            // and without any uri from a device with no session left (an idle phone)
+            // can apparently happen when a state is transferred and was started with "uris" via the api
             Some(ref uri) if uri == "-" || uri.is_empty() => None,
             Some(ref uri) => Some(uri.clone()),
         };
@@ -2350,9 +2351,12 @@ impl SpircTask {
         self.publish_local_activation(true);
         self.player
             .emit_session_connected_event(self.session.connection_id(), self.session.username());
-        // A sender the device list doesn't name yet is reported once it does.
+        // A sender the device list doesn't name yet is reported once it does,
+        // as a change even if it is the controller reported before.
         if self.unresolved_sender.is_none() {
             self.report_client(true);
+        } else {
+            self.reported_client = None;
         }
 
         self.player
