@@ -16,7 +16,6 @@ use crate::{
 };
 use protobuf::MessageField;
 use std::collections::HashMap;
-use uuid::Uuid;
 
 const LOCAL_FILES_IDENTIFIER: &str = "spotify:local-files";
 const SEARCH_IDENTIFIER: &str = "spotify:search";
@@ -62,6 +61,17 @@ fn page_url_to_uri(page_url: &str) -> String {
         .take(3)
         .collect::<Vec<&str>>()
         .join(":")
+}
+
+/// The uid official clients give a context track that arrives without one: the
+/// first 20 hex digits of SHA-1 over its uri. Receivers of a transfer locate the
+/// current track by uid, so a random one makes them restart it from the start.
+fn derived_uid(uri: &str) -> String {
+    use sha1::{Digest, Sha1};
+    Sha1::digest(uri.as_bytes())[..10]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 impl ConnectState {
@@ -464,13 +474,12 @@ impl ConnectState {
             provider.unwrap_or(Provider::Context)
         };
 
-        // assumption: the uid is used as unique-id of any item
-        //  - queue resorting is done by each client and orients itself by the given uid
-        //  - if no uid is present, resorting doesn't work or behaves not as intended
+        // clients find the current track and order the queue by uid; one derived
+        // from the uri is only unique while a track appears once, which server
+        // contexts with duplicates cover by sending their own uids
         let uid = match ctx_track.uid.as_ref() {
             Some(uid) if !uid.is_empty() => uid.to_string(),
-            // so providing a unique id should allow to resort the queue
-            _ => Uuid::new_v4().as_simple().to_string(),
+            _ => derived_uid(&uri),
         };
 
         let mut metadata = page_metadata.cloned().unwrap_or_default();
@@ -516,5 +525,23 @@ impl ConnectState {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod derived_uid_tests {
+    use super::derived_uid;
+
+    #[test]
+    fn matches_the_uids_the_official_clients_publish() {
+        // Observed from the Android app (9.1.84) for context tracks.
+        assert_eq!(
+            derived_uid("spotify:track:49sFu3Kz7zf94qT27b2ZF9"),
+            "70020a96826a18044002"
+        );
+        assert_eq!(
+            derived_uid("spotify:track:3TaeBT5aGh7qxbxTPoLpf1"),
+            "46f452aea817d25014ef"
+        );
     }
 }
