@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [connect] Take playback from another device in a fraction of a second: `Spirc::transfer` no longer waits on its own request, which Spotify answers only after librespot handled the transfer
 - [core] Report Windows ARM/ARM64 as Win32 x86_64 to avoid Access Point authentication rejection
 - [core, metadata, cli] Resolve Rust 1.98 Clippy warnings without changing behavior
 - [core] Include socket and proxy setup in the access-point connection timeout so retries can proceed
