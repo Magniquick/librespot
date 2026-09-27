@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [connect] Resolve each context with one request: other work on the task loop no longer cancels a resolve in flight and sends it again
 - [core] Report Windows ARM/ARM64 as Win32 x86_64 to avoid Access Point authentication rejection
 - [core, metadata, cli] Resolve Rust 1.98 Clippy warnings without changing behavior
 - [core] Include socket and proxy setup in the access-point connection timeout so retries can proceed

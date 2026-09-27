@@ -10,6 +10,7 @@ use std::{
     cmp::PartialEq,
     collections::{HashMap, VecDeque},
     fmt::{Display, Formatter},
+    future::Future,
     hash::Hash,
     time::Duration,
 };
@@ -215,39 +216,69 @@ impl ContextResolver {
         self.find_next().is_some()
     }
 
+    /// The next context to resolve and the request that resolves it. The
+    /// request needs nothing from the resolver, so it can run off the caller's
+    /// loop and can't be cancelled by the loop's other work.
+    pub fn next_request(
+        &self,
+        recent_track_uri: impl Fn() -> Vec<String>,
+    ) -> Option<(
+        ResolveContext,
+        impl Future<Output = Result<Context, Error>> + Send + 'static,
+    )> {
+        let (next, resolve_uri, _) = self.find_next()?;
+        let next = next.clone();
+        let resolve_uri = resolve_uri.to_string();
+        let recent_track_uri = match next.update {
+            ContextType::Autoplay => recent_track_uri(),
+            ContextType::Default => Vec::new(),
+        };
+        let session = self.session.clone();
+        let item = next.clone();
+        let request = async move {
+            match next.update {
+                ContextType::Default => {
+                    let mut ctx = session.spclient().get_context(&resolve_uri).await;
+                    if let Ok(ctx) = ctx.as_mut() {
+                        ctx.uri = Some(next.context_uri().to_string());
+                        ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
+                    }
+
+                    ctx
+                }
+                ContextType::Autoplay => {
+                    if resolve_uri.contains("spotify:show:")
+                        || resolve_uri.contains("spotify:episode:")
+                    {
+                        // autoplay is not supported for podcasts
+                        return Err(ContextResolverError::NotAllowedContext(resolve_uri).into());
+                    }
+
+                    let request = AutoplayContextRequest {
+                        context_uri: Some(resolve_uri),
+                        recent_track_uri,
+                        ..Default::default()
+                    };
+                    session.spclient().get_autoplay_context(&request).await
+                }
+            }
+        };
+        Some((item, request))
+    }
+
+    /// Whether `item` is still the next context to resolve.
+    pub fn is_next(&self, item: &ResolveContext) -> bool {
+        self.find_next().is_some_and(|(next, _, _)| next == item)
+    }
+
     pub async fn get_next_context(
         &self,
         recent_track_uri: impl Fn() -> Vec<String>,
     ) -> Result<Context, Error> {
-        let (next, resolve_uri, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
-
-        match next.update {
-            ContextType::Default => {
-                let mut ctx = self.session.spclient().get_context(resolve_uri).await;
-                if let Ok(ctx) = ctx.as_mut() {
-                    ctx.uri = Some(next.context_uri().to_string());
-                    ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
-                }
-
-                ctx
-            }
-            ContextType::Autoplay => {
-                if resolve_uri.contains("spotify:show:") || resolve_uri.contains("spotify:episode:")
-                {
-                    // autoplay is not supported for podcasts
-                    Err(ContextResolverError::NotAllowedContext(
-                        resolve_uri.to_string(),
-                    ))?
-                }
-
-                let request = AutoplayContextRequest {
-                    context_uri: Some(resolve_uri.to_string()),
-                    recent_track_uri: recent_track_uri(),
-                    ..Default::default()
-                };
-                self.session.spclient().get_autoplay_context(&request).await
-            }
-        }
+        let (_, request) = self
+            .next_request(recent_track_uri)
+            .ok_or(ContextResolverError::NoNext)?;
+        request.await
     }
 
     pub fn mark_next_unavailable(&mut self) {
