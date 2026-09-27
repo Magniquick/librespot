@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [connect] Keep the position when transferring away from librespot by deriving missing context-track uids as official clients do
 - [connect] Resume a transferred track at its extrapolated position when it was published at 0, honouring the playback speed
 - [connect] Accept transfers without a context uri, and drop a transfer's pending state when nothing will finish it
+- [playback, connect] Continue with the next track when a start position or seek is past the end of the track, instead of replaying it
 - [core] Report Windows ARM/ARM64 as Win32 x86_64 to avoid Access Point authentication rejection
 - [core, metadata, cli] Resolve Rust 1.98 Clippy warnings without changing behavior
 - [core] Include socket and proxy setup in the access-point connection timeout so retries can proceed

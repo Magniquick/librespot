@@ -100,6 +100,10 @@ struct SpircTask {
 
     /// is set when transferring, and used after resolving the contexts to finish the transfer
     pub transfer_state: Option<TransferState>,
+    /// A track that ended (for example a transferred position past its end)
+    /// while the transfer was still being set up, keyed by its play request.
+    /// Handled once the transfer's context is resolved.
+    pending_end_of_track: Option<u64>,
 
     /// when set to true, it will update the volume after [VOLUME_UPDATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
@@ -164,6 +168,7 @@ fn transfer_position(playback: &Playback, now_ms: i64) -> u32 {
     };
     position.clamp(0, i64::from(u32::MAX)) as u32
 }
+
 
 /// The spotify connect handle
 pub struct Spirc {
@@ -335,6 +340,7 @@ impl Spirc {
             session,
 
             transfer_state: None,
+            pending_end_of_track: None,
             update_volume: false,
             update_state: false,
 
@@ -700,6 +706,44 @@ impl SpircTask {
         self.session.dealer().close().await;
     }
 
+    /// Continues after a track that ended while the transfer was being set up,
+    /// once there is something to continue with.
+    fn resume_pending_end_of_track(&mut self) {
+        let Some(ended) = self.pending_end_of_track else {
+            return;
+        };
+        if Some(ended) != self.play_request_id {
+            // A newer playback replaced the track that ended.
+            self.pending_end_of_track = None;
+            return;
+        }
+        let resolving = self.context_resolver.has_next();
+        // The transfer finishes when its context is resolved.
+        if self.transfer_state.is_some() && resolving {
+            return;
+        }
+        // At the end of the context, autoplay may still be on its way.
+        if resolving
+            && !self.connect_state.repeat_track()
+            && !self.connect_state.has_next_tracks(None)
+        {
+            return;
+        }
+        self.pending_end_of_track = None;
+        if let Err(why) = self.handle_end_of_track() {
+            error!("continuing after a track that ended during the transfer failed: {why}");
+        }
+    }
+
+    fn handle_end_of_track(&mut self) -> Result<(), Error> {
+        let next_track = self
+            .connect_state
+            .repeat_track()
+            .then(|| self.connect_state.current_track(|t| t.uri.clone()));
+
+        self.handle_next(next_track)
+    }
+
     fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {
         let next_context = match next_context {
             Err(why) => {
@@ -710,6 +754,7 @@ impl SpircTask {
                     // The transfer's context can't be resolved: it will not finish.
                     self.transfer_state = None;
                 }
+                self.resume_pending_end_of_track();
                 return false;
             }
             Ok(ctx) => ctx,
@@ -742,6 +787,7 @@ impl SpircTask {
         };
 
         self.context_resolver.remove_used_and_invalid();
+        self.resume_pending_end_of_track();
         update_state
     }
 
@@ -853,12 +899,14 @@ impl SpircTask {
 
         match event {
             PlayerEvent::EndOfTrack { .. } => {
-                let next_track = self
-                    .connect_state
-                    .repeat_track()
-                    .then(|| self.connect_state.current_track(|t| t.uri.clone()));
-
-                self.handle_next(next_track)?
+                // Moving on needs the context the transfer is still resolving;
+                // without it there is no next track and playback would stop.
+                if self.transfer_state.is_some() && self.context_resolver.has_next() {
+                    debug!("track ended while the transfer is being set up, continuing once it is");
+                    self.pending_end_of_track = self.play_request_id;
+                    return Ok(());
+                }
+                self.handle_end_of_track()?
             }
             PlayerEvent::Loading { .. } => match self.play_status {
                 SpircPlayStatus::LoadingPlay { position_ms } => {
@@ -1232,6 +1280,7 @@ impl SpircTask {
     }
 
     fn handle_transfer(&mut self, mut transfer: TransferState) -> Result<(), Error> {
+        self.pending_end_of_track = None;
         // A transfer replaces one still being set up; finishing that one later,
         // or its resolve replacing the context, would undo this one.
         if self.transfer_state.take().is_some() {
@@ -1372,8 +1421,9 @@ impl SpircTask {
 
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
         self.context_resolver.clear();
-        // Nothing will finish setting up a transfer.
+        // Nothing will finish setting up a transfer or continue a parked track.
         self.transfer_state = None;
+        self.pending_end_of_track = None;
 
         self.play_status = SpircPlayStatus::Stopped {};
         self.connect_state
@@ -1433,6 +1483,7 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
+        self.pending_end_of_track = None;
         // A load replaces a transfer still being set up; finishing that transfer,
         // or its resolve replacing the context, would undo the load.
         if self.transfer_state.take().is_some() {
@@ -1607,13 +1658,19 @@ impl SpircTask {
                 position_ms,
                 preloading_of_next_track_triggered,
             } => {
-                self.player.play();
+                // A track that already ended (past its end on a transfer) waits for
+                // its context to move on: don't sound it, just continue playing
+                // with whatever follows it.
+                if self.pending_end_of_track.is_none() {
+                    self.player.play();
+                }
                 self.connect_state
                     .update_position(position_ms, self.now_ms());
                 self.play_status = SpircPlayStatus::Playing {
                     nominal_start_time: self.now_ms() - position_ms as i64,
                     preloading_of_next_track_triggered,
                 };
+                self.connect_state.set_status(&self.play_status);
             }
             SpircPlayStatus::LoadingPause { position_ms } => {
                 self.player.play();
@@ -1667,6 +1724,15 @@ impl SpircTask {
         let duration = self.connect_state.player().duration;
         if i64::from(position_ms) > duration {
             warn!("tried to seek to {position_ms}ms of {duration}ms");
+            return;
+        }
+
+        // The track already ended and the player has nothing to seek: load it
+        // again at the requested position.
+        if self.pending_end_of_track.take().is_some() {
+            if let Err(why) = self.load_track(self.connect_state.is_playing(), position_ms) {
+                warn!("couldn't restart the ended track: {why}");
+            }
             return;
         }
 
@@ -1774,6 +1840,8 @@ impl SpircTask {
     }
 
     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
+        // The user moved on: a track that ended during a transfer is settled.
+        self.pending_end_of_track = None;
         let continue_playing = self.connect_state.is_playing();
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
@@ -1827,11 +1895,20 @@ impl SpircTask {
             match self.connect_state.prev_track()? {
                 None if repeat_context => self.connect_state.reset_playback_to_position(None)?,
                 None => {
+                    self.pending_end_of_track = None;
                     self.connect_state.reset_playback_to_position(None)?;
                     self.handle_stop()
                 }
-                Some(_) => self.load_track(self.connect_state.is_playing(), 0)?,
+                Some(_) => {
+                    // A new track settles any track that ended during a transfer.
+                    self.pending_end_of_track = None;
+                    self.load_track(self.connect_state.is_playing(), 0)?
+                }
             }
+        } else if self.pending_end_of_track.take().is_some() {
+            // The track already ended (past its end on a transfer) and the player
+            // has nothing to seek: restart it by loading it again.
+            self.load_track(self.connect_state.is_playing(), 0)?;
         } else {
             self.handle_seek(0);
         }
