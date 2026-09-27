@@ -26,6 +26,9 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(3);
 component! {
     Login5Manager : Login5ManagerInner {
         auth_token: Option<Token> = None,
+        // Held while a token is being fetched, so requests that need one at the
+        // same time wait for that fetch instead of each starting their own.
+        refreshing: std::sync::Arc<tokio::sync::Mutex<()>> = Default::default(),
     }
 }
 
@@ -169,16 +172,25 @@ impl Login5Manager {
             return Err(Login5Error::NoStoredCredentials.into());
         }
 
-        let auth_token = self.lock(|inner| {
-            if let Some(token) = &inner.auth_token {
-                if token.is_expired() {
-                    inner.auth_token = None;
+        let cached = || {
+            self.lock(|inner| {
+                if let Some(token) = &inner.auth_token {
+                    if token.is_expired() {
+                        inner.auth_token = None;
+                    }
                 }
-            }
-            inner.auth_token.clone()
-        });
+                inner.auth_token.clone()
+            })
+        };
 
-        if let Some(auth_token) = auth_token {
+        if let Some(auth_token) = cached() {
+            return Ok(auth_token);
+        }
+
+        let refreshing = self.lock(|inner| inner.refreshing.clone());
+        let _refreshing = refreshing.lock().await;
+        // Another request may have fetched one while this one waited.
+        if let Some(auth_token) = cached() {
             return Ok(auth_token);
         }
 
