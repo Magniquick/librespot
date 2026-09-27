@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [playback, connect] Continue with the next track when a start position is past the end of the track, instead of replaying it; `Player::seek` past the end ends the track
 - [core] Report Windows ARM/ARM64 as Win32 x86_64 to avoid Access Point authentication rejection
 - [core, metadata, cli] Resolve Rust 1.98 Clippy warnings without changing behavior
 - [core] Include socket and proxy setup in the access-point connection timeout so retries can proceed

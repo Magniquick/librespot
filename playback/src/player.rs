@@ -678,6 +678,36 @@ struct PlayerLoadedTrackData {
     duration_ms: u32,
     stream_position_ms: u32,
     is_explicit: bool,
+    /// The requested start position was past the end: the track already
+    /// finished (a transferred or resumed position extrapolated beyond it).
+    start_past_end: bool,
+}
+
+impl PlayerLoadedTrackData {
+    /// Positions an already loaded track for a new start. A position past the
+    /// end, or one the decoder rejects, marks the track finished instead, so
+    /// playback moves on rather than failing the load.
+    fn seek_for_start(&mut self, position_ms: u32) {
+        self.start_past_end = false;
+        if position_ms > self.duration_ms {
+            warn!(
+                "Start position of {position_ms} ms exceeds track's duration of {} ms, treating the track as finished",
+                self.duration_ms
+            );
+            self.start_past_end = true;
+        } else if position_ms != self.stream_position_ms {
+            // This may be blocking.
+            match self.decoder.seek(position_ms) {
+                Ok(position) => self.stream_position_ms = position,
+                Err(e) => {
+                    error!(
+                        "Seeking to {position_ms} ms failed, treating the track as finished: {e}"
+                    );
+                    self.start_past_end = true;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -826,6 +856,7 @@ impl PlayerState {
                         duration_ms,
                         stream_position_ms,
                         is_explicit,
+                        start_past_end: false,
                     },
                 };
             }
@@ -1209,12 +1240,14 @@ impl PlayerTrackLoader {
             };
 
             let duration_ms = audio_item.duration_ms;
-            // Don't try to seek past the track's duration.
-            // If the position is invalid just start from
-            // the beginning of the track.
-            let position_ms = if position_ms > duration_ms {
+            // Don't try to seek past the track's duration: the decoder rejects it.
+            // A start position beyond the end means the track already finished
+            // (for example a transferred position extrapolated past it), so load it
+            // at the start and let playback report the end of the track at once.
+            let start_past_end = position_ms > duration_ms;
+            let position_ms = if start_past_end {
                 warn!(
-                    "Invalid start position of {position_ms} ms exceeds track's duration of {duration_ms} ms, starting track from the beginning"
+                    "Start position of {position_ms} ms exceeds track's duration of {duration_ms} ms, treating the track as finished"
                 );
                 0
             } else {
@@ -1251,6 +1284,7 @@ impl PlayerTrackLoader {
                 duration_ms,
                 stream_position_ms,
                 is_explicit,
+                start_past_end,
             });
         }
     }
@@ -1303,6 +1337,8 @@ impl PlayerTrackLoader {
 
         let local_file_metadata = decoder.local_file_metadata().unwrap_or_default();
 
+        let start_past_end = u128::from(position_ms) > duration.as_millis();
+        let position_ms = if start_past_end { 0 } else { position_ms };
         let stream_position_ms = match decoder.seek(position_ms) {
             Ok(new_position_ms) => new_position_ms,
             Err(e) => {
@@ -1330,6 +1366,7 @@ impl PlayerTrackLoader {
             duration_ms: duration.as_millis() as u32,
             stream_position_ms,
             is_explicit: false,
+            start_past_end,
             audio_item: AudioItem {
                 duration_ms: duration.as_millis() as u32,
                 uri: track_uri.to_uri().unwrap_or_default(),
@@ -1914,6 +1951,40 @@ impl PlayerInternal {
         }
     }
 
+    /// Ends the playing track as if its stream ran out, so the controller moves
+    /// on exactly as it does at a natural end.
+    fn end_current_track(&mut self) {
+        // Paused has no transition to EndOfTrack; report the end and let the
+        // controller's next load replace the paused track.
+        if let PlayerState::Paused {
+            ref track_id,
+            play_request_id,
+            ..
+        } = self.state
+        {
+            self.send_event(PlayerEvent::EndOfTrack {
+                track_id: track_id.clone(),
+                play_request_id,
+            });
+            return;
+        }
+        if !matches!(self.state, PlayerState::Playing { .. }) {
+            return;
+        }
+        self.state.playing_to_end_of_track();
+        if let PlayerState::EndOfTrack {
+            ref track_id,
+            play_request_id,
+            ..
+        } = self.state
+        {
+            self.send_event(PlayerEvent::EndOfTrack {
+                track_id: track_id.clone(),
+                play_request_id,
+            });
+        }
+    }
+
     fn start_playback(
         &mut self,
         track_id: SpotifyUri,
@@ -1922,10 +1993,16 @@ impl PlayerInternal {
         start_playback: bool,
     ) {
         let audio_item = Box::new(loaded_track.audio_item.clone());
+        let start_past_end = loaded_track.start_past_end;
 
         self.send_event(PlayerEvent::TrackChanged { audio_item });
 
-        let position_ms = loaded_track.stream_position_ms;
+        // A finished track reports its end, not a start it will never play.
+        let position_ms = if start_past_end {
+            loaded_track.duration_ms
+        } else {
+            loaded_track.stream_position_ms
+        };
 
         let mut config = self.config.clone();
         if config.normalisation_type == NormalisationType::Auto {
@@ -1970,6 +2047,9 @@ impl PlayerInternal {
                 suggested_to_preload_next_track: false,
                 is_explicit: loaded_track.is_explicit,
             };
+            if start_past_end {
+                self.end_current_track();
+            }
         } else {
             self.ensure_sink_stopped(false);
 
@@ -1987,12 +2067,14 @@ impl PlayerInternal {
                 suggested_to_preload_next_track: false,
                 is_explicit: loaded_track.is_explicit,
             };
-
             self.send_event(PlayerEvent::Paused {
                 track_id,
                 play_request_id,
                 position_ms,
             });
+            if start_past_end {
+                self.end_current_track();
+            }
         }
     }
 
@@ -2040,10 +2122,7 @@ impl PlayerInternal {
                     }
                 };
 
-                if position_ms != loaded_track.stream_position_ms {
-                    // This may be blocking.
-                    loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
-                }
+                loaded_track.seek_for_start(position_ms);
                 self.preload = PlayerPreload::None;
                 self.start_playback(track_id, play_request_id, loaded_track, play);
                 if let PlayerState::Invalid = self.state {
@@ -2061,20 +2140,37 @@ impl PlayerInternal {
             track_id: ref current_track_id,
             ref mut stream_position_ms,
             ref mut decoder,
+            duration_ms: current_duration_ms,
             ..
         }
         | PlayerState::Paused {
             track_id: ref current_track_id,
             ref mut stream_position_ms,
             ref mut decoder,
+            duration_ms: current_duration_ms,
             ..
         } = self.state
         {
             if *current_track_id == track_id {
-                // we can use the current decoder. Ensure it's at the correct position.
-                if position_ms != *stream_position_ms {
+                // A position past the end means the track already finished; the
+                // decoder would reject the seek and leave the player invalid.
+                let mut start_past_end = position_ms > current_duration_ms;
+                if start_past_end {
+                    warn!(
+                        "Start position of {position_ms} ms exceeds track's duration of {current_duration_ms} ms, treating the track as finished"
+                    );
+                } else if position_ms != *stream_position_ms {
+                    // we can use the current decoder. Ensure it's at the correct position.
                     // This may be blocking.
-                    *stream_position_ms = decoder.seek(position_ms)?;
+                    match decoder.seek(position_ms) {
+                        Ok(position) => *stream_position_ms = position,
+                        Err(e) => {
+                            error!(
+                                "Seeking to {position_ms} ms failed, treating the track as finished: {e}"
+                            );
+                            start_past_end = true;
+                        }
+                    }
                 }
 
                 // Move the info from the current state into a PlayerLoadedTrackData so we can use
@@ -2113,6 +2209,7 @@ impl PlayerInternal {
                         duration_ms,
                         stream_position_ms,
                         is_explicit,
+                        start_past_end,
                     };
 
                     self.preload = PlayerPreload::None;
@@ -2148,10 +2245,7 @@ impl PlayerInternal {
                     mut loaded_track,
                 } = preload
                 {
-                    if position_ms != loaded_track.stream_position_ms {
-                        // This may be blocking
-                        loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
-                    }
+                    loaded_track.seek_for_start(position_ms);
                     self.start_playback(track_id, play_request_id, *loaded_track, play);
                     return Ok(());
                 } else {
@@ -2276,6 +2370,22 @@ impl PlayerInternal {
                 start_playback,
                 position_ms,
             );
+        }
+
+        let past_end = match self.state {
+            PlayerState::Playing { duration_ms, .. } | PlayerState::Paused { duration_ms, .. }
+                if position_ms > duration_ms =>
+            {
+                Some(duration_ms)
+            }
+            _ => None,
+        };
+        if let Some(duration_ms) = past_end {
+            warn!(
+                "Seek to {position_ms} ms is past the track's {duration_ms} ms, ending the track"
+            );
+            self.end_current_track();
+            return Ok(());
         }
 
         if let Some(decoder) = self.state.decoder() {
