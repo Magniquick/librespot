@@ -32,7 +32,7 @@ use crate::{
     },
 };
 use futures_util::StreamExt;
-use librespot_protocol::context_page::ContextPage;
+use librespot_protocol::{context_page::ContextPage, playback::Playback};
 use protobuf::MessageField;
 use std::{
     future::Future,
@@ -144,6 +144,26 @@ const CONTEXT_FETCH_THRESHOLD: usize = 2;
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
 // to reduce updates to remote, we group some request by waiting for a set amount of time
 const UPDATE_STATE_DELAY: Duration = Duration::from_millis(200);
+/// Where a transferred track resumes, as the official clients compute it: the
+/// published position moved on at the published speed since it was recorded,
+/// including from 0 (the track had just started). A paused or buffering source
+/// publishes speed 0, and a missing speed counts as 0. Unlike the official
+/// clients, a missing timestamp leaves the position as published rather than
+/// extrapolating from the epoch. Out-of-range data is clamped rather than
+/// failing the transfer; a position past the end is left to the player.
+fn transfer_position(playback: &Playback, now_ms: i64) -> u32 {
+    let reported = i64::from(playback.position_as_of_timestamp.unwrap_or_default());
+    let timestamp = playback.timestamp.unwrap_or_default();
+    let position = if playback.is_paused.unwrap_or_default() || timestamp <= 0 {
+        reported
+    } else {
+        let speed = playback.playback_speed.unwrap_or_default().max(0.0);
+        let elapsed = now_ms.saturating_sub(timestamp).max(0) as f64;
+        // float-to-int casts saturate; the sum must too
+        reported.saturating_add((elapsed * speed) as i64)
+    };
+    position.clamp(0, i64::from(u32::MAX)) as u32
+}
 
 /// The spotify connect handle
 pub struct Spirc {
@@ -1282,16 +1302,7 @@ impl SpircTask {
         };
 
         // update position if the track continued playing
-        let transfer_timestamp = transfer.playback.timestamp.unwrap_or_default();
-        let position = match transfer.playback.position_as_of_timestamp {
-            Some(position) if transfer.playback.is_paused.unwrap_or_default() => position.into(),
-            // update position if the track continued playing
-            Some(position) if position > 0 => {
-                let time_since_position_update = timestamp - transfer_timestamp;
-                i64::from(position) + time_since_position_update
-            }
-            _ => 0,
-        };
+        let position = transfer_position(&transfer.playback, timestamp);
 
         let is_playing = !transfer.playback.is_paused();
 
@@ -1326,7 +1337,7 @@ impl SpircTask {
             }
         }
 
-        self.load_track(is_playing, position.try_into()?)
+        self.load_track(is_playing, position)
     }
 
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
@@ -1963,6 +1974,82 @@ impl Drop for SpircTask {
 
 #[cfg(test)]
 mod recovery_tests {
+    mod transfer_position {
+        use super::super::transfer_position;
+        use librespot_protocol::playback::Playback;
+
+        fn playback(position: i32, timestamp: i64, speed: Option<f64>, paused: bool) -> Playback {
+            Playback {
+                position_as_of_timestamp: Some(position),
+                timestamp: Some(timestamp),
+                playback_speed: speed,
+                is_paused: Some(paused),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn a_playing_track_moves_on_from_where_it_was_published() {
+            assert_eq!(
+                transfer_position(&playback(60_000, 1_000, Some(1.0), false), 6_000),
+                65_000
+            );
+        }
+
+        #[test]
+        fn a_track_published_at_zero_still_moves_on() {
+            assert_eq!(
+                transfer_position(&playback(0, 1_000, Some(1.0), false), 12_000),
+                11_000
+            );
+        }
+
+        #[test]
+        fn paused_or_speed_zero_or_missing_speed_stays_put() {
+            assert_eq!(
+                transfer_position(&playback(60_000, 1_000, Some(1.0), true), 9_000),
+                60_000
+            );
+            assert_eq!(
+                transfer_position(&playback(60_000, 1_000, Some(0.0), false), 9_000),
+                60_000
+            );
+            assert_eq!(
+                transfer_position(&playback(60_000, 1_000, None, false), 9_000),
+                60_000
+            );
+        }
+
+        #[test]
+        fn a_missing_timestamp_is_not_extrapolated_from_the_epoch() {
+            assert_eq!(
+                transfer_position(&playback(5_000, 0, Some(1.0), false), 1_790_000_000_000),
+                5_000
+            );
+        }
+
+        #[test]
+        fn out_of_range_data_is_clamped_not_failed() {
+            assert_eq!(
+                transfer_position(&playback(-5, 1_000, Some(1.0), true), 2_000),
+                0
+            );
+            assert_eq!(
+                transfer_position(&playback(0, 1_000, Some(-3.0), false), 9_000),
+                0
+            );
+            assert_eq!(
+                transfer_position(&playback(i32::MAX, 1, Some(f64::MAX), false), i64::MAX),
+                u32::MAX
+            );
+            // A clock behind the publisher's doesn't move the position back.
+            assert_eq!(
+                transfer_position(&playback(60_000, 9_000, Some(1.0), false), 1_000),
+                60_000
+            );
+        }
+    }
+
     use super::*;
 
     #[tokio::test]
