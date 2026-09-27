@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- [connect] Add method `transfer_to` to `Spirc` to hand playback to another device and wait until it is active
 - [connect] Retain playback snapshots after an unexpected disconnect so clients can restore context, shuffle order, and queued tracks on a new session
 - [core] Add an in-memory credential cache for clients that persist grants in a protected store
 - [core] Add method `get_playlist_range` to `SpClient` for a window of a playlist's items with its header decorated on
