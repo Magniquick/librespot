@@ -1268,11 +1268,8 @@ impl PlayerTrackLoader {
                 }
             };
 
-            // Ensure streaming mode now that we are ready to play from the requested
-            // position; a finished track won't be played, so it needn't stream.
-            if !start_past_end {
-                stream_loader_controller.set_stream_mode();
-            }
+            // Ensure streaming mode now that we are ready to play from the requested position.
+            stream_loader_controller.set_stream_mode();
 
             let is_explicit = audio_item.is_explicit;
 
@@ -1997,11 +1994,6 @@ impl PlayerInternal {
     ) {
         let audio_item = Box::new(loaded_track.audio_item.clone());
         let start_past_end = loaded_track.start_past_end;
-        // A track that will play streams, whichever path loaded or reused it; one
-        // loaded only to end at once (past its end) needn't.
-        if !start_past_end {
-            loaded_track.stream_loader_controller.set_stream_mode();
-        }
 
         self.send_event(PlayerEvent::TrackChanged { audio_item });
 
