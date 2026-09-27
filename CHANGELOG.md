@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- [core] Add method `get_account_attributes` to `SpClient`
 - [connect] Retain playback snapshots after an unexpected disconnect so clients can restore context, shuffle order, and queued tracks on a new session
 - [core] Add an in-memory credential cache for clients that persist grants in a protected store
 - [core] Add method `get_playlist_range` to `SpClient` for a window of a playlist's items with its header decorated on
@@ -22,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [connect] Accept transfers without a context uri, and drop a transfer's pending state when nothing will finish it
 - [playback, connect] Continue with the next track when a start position or seek is past the end of the track, instead of replaying it
 - [connect] Report the controlling device's client id, name, brand and model in `session_client_changed`
+- [connect] Apply autoplay and explicit-content changes from other clients by reading the account attributes
 - [core] Report Windows ARM/ARM64 as Win32 x86_64 to avoid Access Point authentication rejection
 - [core, metadata, cli] Resolve Rust 1.98 Clippy warnings without changing behavior
 - [core] Include socket and proxy setup in the access-point connection timeout so retries can proceed
