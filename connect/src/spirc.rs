@@ -878,9 +878,12 @@ impl SpircTask {
             )));
             return;
         }
-        // The target resumes from the published state: publish the current one
+        // The target resumes from the published state. Changes are published as
+        // they happen, and Spotify moves the position on from the published
+        // timestamp; only a change still waiting to be published needs sending
         // before the transfer is requested.
-        if self.connect_state.is_active() {
+        if self.connect_state.is_active() && self.update_state {
+            self.update_state = false;
             if let Err(why) = self.notify().await {
                 warn!("couldn't publish the state before transferring: {why}");
             }
