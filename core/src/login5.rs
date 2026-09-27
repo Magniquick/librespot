@@ -16,9 +16,10 @@ use librespot_protocol::{
 };
 use protobuf::well_known_types::duration::Duration as ProtoDuration;
 use protobuf::{Message, MessageField};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
-use tokio::time::sleep;
+use tokio::{sync::Mutex as AsyncMutex, time::sleep};
 
 const MAX_LOGIN_TRIES: u8 = 3;
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -28,7 +29,7 @@ component! {
         auth_token: Option<Token> = None,
         // Held while a token is being fetched, so requests that need one at the
         // same time wait for that fetch instead of each starting their own.
-        refreshing: std::sync::Arc<tokio::sync::Mutex<()>> = Default::default(),
+        refreshing: Arc<AsyncMutex<()>> = Default::default(),
     }
 }
 
