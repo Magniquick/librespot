@@ -1918,6 +1918,9 @@ impl SpircTask {
                 && cluster.active_device_id != self.session.device_id();
             if became_inactive {
                 info!("device became inactive");
+                // Another device plays now: fall silent at once, not after the
+                // requests that tell Spotify this device is inactive.
+                self.player.stop();
                 self.handle_disconnect().await?;
                 self.handle_stop();
             } else if self.connect_state.is_active() {
