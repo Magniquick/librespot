@@ -17,7 +17,7 @@ use crate::{
         player::{Player, PlayerEvent, PlayerEventChannel},
     },
     protocol::{
-        connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
+        connect::{Cluster, ClusterUpdate, DeviceInfo, LogoutCommand, SetVolumeCommand},
         context::Context,
         explicit_content_pubsub::UserAttributesUpdate,
         playlist4_external::PlaylistModificationInfo,
@@ -35,6 +35,7 @@ use futures_util::StreamExt;
 use librespot_protocol::context_page::ContextPage;
 use protobuf::MessageField;
 use std::{
+    collections::HashMap,
     future::Future,
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
@@ -100,6 +101,15 @@ struct SpircTask {
 
     /// is set when transferring, and used after resolving the contexts to finish the transfer
     pub transfer_state: Option<TransferState>,
+    /// The devices in the latest cluster, to name whoever sends a command.
+    devices: HashMap<String, DeviceInfo>,
+    /// The remote device or Web API app controlling playback; `None` when
+    /// playback was started here.
+    controller: Option<Controller>,
+    /// What the last session_client_changed event reported.
+    reported_client: Option<Controller>,
+    /// A command sender the device list didn't name yet; reported once it does.
+    unresolved_sender: Option<String>,
 
     /// when set to true, it will update the volume after [VOLUME_UPDATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
@@ -144,6 +154,15 @@ const CONTEXT_FETCH_THRESHOLD: usize = 2;
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
 // to reduce updates to remote, we group some request by waiting for a set amount of time
 const UPDATE_STATE_DELAY: Duration = Duration::from_millis(200);
+
+/// The client reported in session_client_changed events.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Controller {
+    client_id: String,
+    name: String,
+    brand: String,
+    model: String,
+}
 
 /// The spotify connect handle
 pub struct Spirc {
@@ -315,6 +334,10 @@ impl Spirc {
             session,
 
             transfer_state: None,
+            devices: HashMap::new(),
+            controller: None,
+            reported_client: None,
+            unresolved_sender: None,
             update_volume: false,
             update_state: false,
 
@@ -752,6 +775,8 @@ impl SpircTask {
             }
             SpircCommand::Activate if !self.connect_state.is_active() => {
                 trace!("Received SpircCommand::{cmd:?}");
+                self.controller = None;
+                self.unresolved_sender = None;
                 self.handle_activate();
                 return self.notify().await;
             }
@@ -795,7 +820,12 @@ impl SpircTask {
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
-            SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
+            SpircCommand::Load(command) => {
+                self.controller = None;
+                self.unresolved_sender = None;
+                self.handle_load(command, None, None).await?;
+                self.report_client(false);
+            }
         };
 
         self.notify().await
@@ -938,7 +968,7 @@ impl SpircTask {
         trace!("Received connection ID update: {connection_id:?}");
         self.session.set_connection_id(&connection_id);
 
-        let cluster = match self
+        let mut cluster = match self
             .connect_state
             .notify_new_device_appeared(&self.session)
             .await
@@ -950,6 +980,7 @@ impl SpircTask {
             }
         }
         .ok_or(SpircError::FailedDealerSetup)?;
+        self.devices = std::mem::take(&mut cluster.device);
 
         debug!(
             "successfully put connect state for {} with connection-id {connection_id}",
@@ -1044,7 +1075,14 @@ impl SpircTask {
             cluster_update.cluster.active_device_id
         );
 
-        if let Some(cluster) = cluster_update.cluster.take() {
+        if let Some(mut cluster) = cluster_update.cluster.take() {
+            self.devices = std::mem::take(&mut cluster.device);
+            if let Some(sender) = self.unresolved_sender.clone() {
+                self.set_controller_from(&sender);
+                if self.unresolved_sender.is_none() && self.connect_state.is_active() {
+                    self.report_client(false);
+                }
+            }
             let became_inactive = self.connect_state.is_active()
                 && cluster.active_device_id != self.session.device_id();
             if became_inactive {
@@ -1069,6 +1107,8 @@ impl SpircTask {
         (request, sender): RequestReply,
     ) -> Result<(), Error> {
         self.connect_state.set_last_command(request.clone());
+        let previous_controller = (self.controller.clone(), self.unresolved_sender.clone());
+        self.set_controller_from(&request.sent_by_device_id);
 
         debug!(
             "handling: '{}' from {}",
@@ -1082,6 +1122,15 @@ impl SpircTask {
                 Reply::Failure
             }
         };
+        // A different device took control of the playback we are playing.
+        if matches!(response, Reply::Success) {
+            if self.connect_state.is_active() {
+                self.report_client(false);
+            }
+        } else {
+            // A failed command took no control.
+            (self.controller, self.unresolved_sender) = previous_controller;
+        }
 
         sender.send(response).map_err(Into::into)
     }
@@ -1355,16 +1404,77 @@ impl SpircTask {
         }
     }
 
+    /// Who sent a command: a device from the cluster, a Web API app
+    /// (`webapi-<client id>`), or nobody remote (`local`, a command from here).
+    /// `Some(None)` for a command from here, `Some(Some(_))` for a named remote
+    /// controller, `None` for a device the device list doesn't name yet.
+    fn controller_for(&self, sender: &str) -> Option<Option<Controller>> {
+        if sender.is_empty() || sender == "local" || sender == self.session.device_id() {
+            return Some(None);
+        }
+        if let Some(device) = self.devices.get(sender) {
+            return Some(Some(Controller {
+                client_id: device.client_id.clone(),
+                name: device.name.clone(),
+                brand: device.brand.clone(),
+                model: device.model.clone(),
+            }));
+        }
+        sender.strip_prefix("webapi-").map(|client_id| {
+            Some(Controller {
+                client_id: client_id.to_string(),
+                ..Default::default()
+            })
+        })
+    }
+
+    fn set_controller_from(&mut self, sender: &str) {
+        match self.controller_for(sender) {
+            Some(controller) => {
+                self.controller = controller;
+                self.unresolved_sender = None;
+            }
+            None => {
+                // Not the previous controller either: report no remote one
+                // until the device list names this sender.
+                self.controller = None;
+                self.unresolved_sender = Some(sender.to_string());
+            }
+        }
+    }
+
+    /// Emits session_client_changed for the current controller, when it differs
+    /// from the last one reported or when `always`.
+    fn report_client(&mut self, always: bool) {
+        if self.unresolved_sender.is_some() && !always {
+            // Reported with its name once the device list has it.
+            return;
+        }
+        // Without a remote controller, report this session's own client (the
+        // session's client id is ours and authenticates us; never overwrite it).
+        let client = self.controller.clone().unwrap_or_else(|| Controller {
+            client_id: self.session.client_id(),
+            name: self.session.client_name(),
+            brand: self.session.client_brand_name(),
+            model: self.session.client_model_name(),
+        });
+        if !always && self.reported_client.as_ref() == Some(&client) {
+            return;
+        }
+        self.player.emit_session_client_changed_event(
+            client.client_id.clone(),
+            client.name.clone(),
+            client.brand.clone(),
+            client.model.clone(),
+        );
+        self.reported_client = Some(client);
+    }
+
     fn handle_activate(&mut self) {
         self.connect_state.set_active(true);
         self.player
             .emit_session_connected_event(self.session.connection_id(), self.session.username());
-        self.player.emit_session_client_changed_event(
-            self.session.client_id(),
-            self.session.client_name(),
-            self.session.client_brand_name(),
-            self.session.client_model_name(),
-        );
+        self.report_client(true);
 
         self.player
             .emit_volume_changed_event(self.connect_state.device_info().volume as u16);
