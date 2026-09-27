@@ -15,13 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [core] Add an in-memory credential cache for clients that persist grants in a protected store
 - [core] Add method `get_playlist_range` to `SpClient` for a window of a playlist's items with its header decorated on
 - [metadata] Add `Playlist::get_range` to fetch a window of a playlist's items without downloading the whole list
-- [connect] Add method `add_to_queue` to `Spirc` to add tracks, episodes, albums and playlists to the queue
 - [connect] Add broadcast/watch channels to `Spirc` for observing remote player, cluster, and queue state independent of whether this device is active
-- [playback] Add `SetQueue` player event, emitting when the queue changes (context loaded, track added to queue, or queue set via Spotify Connect). Gated behind `ConnectConfig::emit_set_queue_events`
-
-### Changed
-
-- [core] Made `SpotifyId::to_base62`, `SpotifyId::to_base16`, `FileId::to_base16`, `SpotifyUri::to_id`, `SpotifyUri::to_uri` infallible (breaking)
 
 ### Fixed
 
@@ -29,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [connect] Keep the position when transferring away from librespot by deriving missing context-track uids as official clients do
 - [connect] Resume a transferred track at its extrapolated position when it was published at 0, honouring the playback speed
 - [connect] Accept transfers without a context uri, and drop a transfer's pending state when nothing will finish it
-- [playback, connect] Continue with the next track when a start position or seek is past the end of the track, instead of replaying it
+- [playback, connect] Continue with the next track when a start position is past the end of the track, instead of replaying it; `Player::seek` past the end ends the track
 - [connect] Report the controlling device's client id, name, brand and model in `session_client_changed`
 - [connect] Apply autoplay and explicit-content changes from other clients by reading the account attributes
 - [connect] Take playback from another device in a fraction of a second: `Spirc::transfer` no longer waits on its own request, which Spotify answers only after librespot handled the transfer

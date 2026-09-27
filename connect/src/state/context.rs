@@ -474,9 +474,9 @@ impl ConnectState {
             provider.unwrap_or(Provider::Context)
         };
 
-        // assumption: the uid is used as unique-id of any item
-        //  - queue resorting is done by each client and orients itself by the given uid
-        //  - if no uid is present, resorting doesn't work or behaves not as intended
+        // clients find the current track and order the queue by uid; one derived
+        // from the uri is only unique while a track appears once, which server
+        // contexts with duplicates cover by sending their own uids
         let uid = match ctx_track.uid.as_ref() {
             Some(uid) if !uid.is_empty() => uid.to_string(),
             _ => derived_uid(&uri),
