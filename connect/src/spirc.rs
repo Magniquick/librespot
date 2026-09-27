@@ -134,6 +134,11 @@ struct SpircTask {
     /// each (for the flip fallback); a newer fetch covers them too.
     pending_attribute_keys: Vec<(String, u32)>,
 
+    /// The context being resolved off the loop, and where its result arrives.
+    resolving: Option<ResolveContext>,
+    resolved_tx: mpsc::UnboundedSender<(ResolveContext, Result<Context, Error>)>,
+    resolved_rx: mpsc::UnboundedReceiver<(ResolveContext, Result<Context, Error>)>,
+
     /// when set to true, it will update the volume after [VOLUME_UPDATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
     update_volume: bool,
@@ -390,6 +395,7 @@ impl Spirc {
 
         let disconnected_playback = Arc::new(Mutex::new(None));
         let (background_tx, background_rx) = mpsc::unbounded_channel();
+        let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
         let mut task = SpircTask {
             disconnected_playback: Arc::clone(&disconnected_playback),
             player,
@@ -432,6 +438,9 @@ impl Spirc {
             autoplay_fetched: false,
             attribute_requests: 0,
             pending_attribute_keys: Vec::new(),
+            resolving: None,
+            resolved_tx,
+            resolved_rx,
             update_volume: false,
             update_state: false,
 
@@ -661,12 +670,14 @@ impl SpircTask {
         }
 
         while !self.session.is_invalid() && !self.shutdown {
-            let commands = self.commands.as_mut();
-            let player_events = self.player_events.as_mut();
-
             // when state and volume update have a higher priority than context resolving
             // because of that the context resolving has to wait, so that the other tasks can finish
-            let allow_context_resolving = !self.update_state && !self.update_volume;
+            if !self.update_state && !self.update_volume {
+                self.start_resolving();
+            }
+
+            let commands = self.commands.as_mut();
+            let player_events = self.player_events.as_mut();
             let transfer_deadline = self
                 .pending_transfer_to
                 .as_ref()
@@ -779,21 +790,17 @@ impl SpircTask {
                 //
                 // to circumvent this behavior, we request each context separately here and
                 // finish after we received our last item of a type
-                next_context = async {
-                    self.context_resolver.get_next_context(|| {
-                        // Sending local file URIs to this endpoint results in a Bad Request status.
-                        // It's likely appropriate to filter them out anyway; Spotify's backend
-                        // has no knowledge about these tracks and so can't do anything with them.
-                        self.connect_state.recent_track_uris()
-                            .into_iter()
-                            .filter(|t| !t.starts_with("spotify:local"))
-                            .collect::<Vec<_>>()
-                    }).await
-                }, if allow_context_resolving && self.context_resolver.has_next() => {
-                    let update_state = self.handle_next_context(next_context);
-                    if update_state {
-                        if let Err(why) = self.notify().await {
-                            error!("update after context resolving failed: {why}")
+                resolved = self.resolved_rx.recv() => if let Some((item, next_context)) = resolved {
+                    if self.resolving.as_ref() == Some(&item) {
+                        self.resolving = None;
+                    }
+                    // A load or transfer since the request replaced what it was for.
+                    if self.context_resolver.is_next(&item) {
+                        let update_state = self.handle_next_context(next_context);
+                        if update_state {
+                            if let Err(why) = self.notify().await {
+                                error!("update after context resolving failed: {why}")
+                            }
                         }
                     }
                 },
@@ -955,6 +962,32 @@ impl SpircTask {
             .then(|| self.connect_state.current_track(|t| t.uri.clone()));
 
         self.handle_next(next_track)
+    }
+
+    /// Resolves the next context off the loop, once: work on the loop would
+    /// cancel an in-flight request and send it again.
+    fn start_resolving(&mut self) {
+        let recent_track_uris = || {
+            // Sending local file URIs to this endpoint results in a Bad Request status.
+            // It's likely appropriate to filter them out anyway; Spotify's backend
+            // has no knowledge about these tracks and so can't do anything with them.
+            self.connect_state
+                .recent_track_uris()
+                .into_iter()
+                .filter(|t| !t.starts_with("spotify:local"))
+                .collect::<Vec<_>>()
+        };
+        let Some((item, request)) = self.context_resolver.next_request(recent_track_uris) else {
+            return;
+        };
+        if self.resolving.as_ref() == Some(&item) {
+            return;
+        }
+        self.resolving = Some(item.clone());
+        let resolved = self.resolved_tx.clone();
+        self.session.spawn(async move {
+            let _ = resolved.send((item, request.await));
+        });
     }
 
     fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {
