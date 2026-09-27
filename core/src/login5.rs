@@ -16,9 +16,10 @@ use librespot_protocol::{
 };
 use protobuf::well_known_types::duration::Duration as ProtoDuration;
 use protobuf::{Message, MessageField};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
-use tokio::time::sleep;
+use tokio::{sync::Mutex as AsyncMutex, time::sleep};
 
 const MAX_LOGIN_TRIES: u8 = 3;
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -26,6 +27,9 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(3);
 component! {
     Login5Manager : Login5ManagerInner {
         auth_token: Option<Token> = None,
+        // Held while a token is being fetched, so requests that need one at the
+        // same time wait for that fetch instead of each starting their own.
+        refreshing: Arc<AsyncMutex<()>> = Default::default(),
     }
 }
 
@@ -169,16 +173,25 @@ impl Login5Manager {
             return Err(Login5Error::NoStoredCredentials.into());
         }
 
-        let auth_token = self.lock(|inner| {
-            if let Some(token) = &inner.auth_token {
-                if token.is_expired() {
-                    inner.auth_token = None;
+        let cached = || {
+            self.lock(|inner| {
+                if let Some(token) = &inner.auth_token {
+                    if token.is_expired() {
+                        inner.auth_token = None;
+                    }
                 }
-            }
-            inner.auth_token.clone()
-        });
+                inner.auth_token.clone()
+            })
+        };
 
-        if let Some(auth_token) = auth_token {
+        if let Some(auth_token) = cached() {
+            return Ok(auth_token);
+        }
+
+        let refreshing = self.lock(|inner| inner.refreshing.clone());
+        let _refreshing = refreshing.lock().await;
+        // Another request may have fetched one while this one waited.
+        if let Some(auth_token) = cached() {
             return Ok(auth_token);
         }
 
